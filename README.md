@@ -19,7 +19,9 @@ The override lasts until the display disconnects, so ModePin re-applies it whene
 - **Login**, through a LaunchAgent that also restarts ModePin if it crashes
 - **Every 60 seconds** as a safety net. This only reads the EDID, so a display that is already correct never flickers.
 
-After each apply it checks again after 6 seconds. A display that refuses the override three times in two minutes is left alone, and the menu bar icon shows a warning, until you reconnect it or choose **Re-apply Now**.
+After each apply it checks again after 6 seconds. A display that refuses the override three times is left alone, and the menu bar icon shows a warning, until you reconnect it, change its settings or choose **Re-apply Now**. A refusing display never flickers in a loop.
+
+Adding a mode isn't always enough: after a reconnect, macOS often keeps the resolution it picked from the display's own EDID. So after applying the override, ModePin also **switches to the display's preferred mode**, which is the first mode you added unless you choose another one. It only does this right after applying. If you pick another resolution yourself, ModePin leaves it alone until the next reconnect.
 
 Settings are tied to the **exact EDID** of each connection, not only to the monitor model. When the same monitor is plugged straight into the Mac's HDMI 2.1 port, it reports a different EDID with its full 7680×2160, and ModePin leaves it alone.
 
@@ -38,6 +40,7 @@ This builds the app, copies it to `/Applications/ModePin.app`, links the `modepi
 Click the display icon in the menu bar. Each external display has a submenu where you can:
 
 - **Add Mode…**: enter e.g. `5120x1440@60`. ModePin warns you if the mode needs more bandwidth than the connection reports.
+- Pick the mode to switch to after connecting (**Switch to This After Connecting**, shown with a checkmark), or turn that off to keep macOS's choice.
 - Remove a mode, switch the display's modes off (**Enabled**), or **Forget This Display**, which restores its own EDID.
 
 The same actions are available from the terminal:
@@ -47,10 +50,11 @@ $ modepin status
 Odyssey G95NC
   State: active
   EDID:  SAM 73D0, 256 bytes, link limit 600 MHz
-  Added: 5120×1440 @ 60 Hz
+  Added: 5120×1440 @ 60 Hz (selected after connecting)
 
 $ modepin add 5120x1440@60          # --display <name> when several are connected
 $ modepin remove 5120x1440@60
+$ modepin prefer 5120x1440@60       # or: modepin prefer none
 $ modepin disable | enable | forget
 $ modepin dump odyssey.bin          # save the current EDID
 $ modepin install-agent | uninstall-agent
@@ -70,7 +74,7 @@ swift scripts/make-icon.swift  # regenerate Resources/AppIcon.icns
 | Path | What's in it |
 |---|---|
 | `Sources/CIOAVService` | Declarations for the private IOAVService functions |
-| `Sources/ModePinCore` | EDID parsing, CVT timings, DisplayID builder, profiles, apply engine |
+| `Sources/ModePinCore` | EDID parsing, CVT timings, DisplayID builder, profiles, apply engine, mode switching |
 | `Sources/ModePin` | Menu bar app, CLI, LaunchAgent handling |
 
 ## Caveats

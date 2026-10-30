@@ -10,6 +10,7 @@ enum CLI {
           status                 Show connected displays and their added modes (default)
           add <WxH@Hz>           Add a mode, e.g. modepin add 5120x1440@60
           remove <WxH@Hz>        Remove an added mode
+          prefer <WxH@Hz|none>   Mode to switch to after connecting (default: first added)
           enable | disable       Switch a display's added modes on or off
           forget                 Restore the display's own EDID and delete its settings
           apply                  Apply all settings now (the app does this automatically)
@@ -45,6 +46,14 @@ enum CLI {
                     print("Removed \(mode) from \(report.name).")
                 }
                 applyIfAppIsNotRunning(engine)
+
+            case "prefer":
+                guard let text = arguments.first else { return fail("Give a mode like 5120x1440@60, or none.") }
+                let mode = DisplayMode(parsing: text)
+                guard mode != nil || text == "none" else { return fail("Give a mode like 5120x1440@60, or none.") }
+                let report = try pickDisplay(engine.status(), query: displayQuery)
+                try engine.setPreferredMode(mode, for: report)
+                print(mode.map { "\(report.name) switches to \($0) after connecting." } ?? "\(report.name) keeps the resolution macOS picks.")
 
             case "enable", "disable":
                 let report = try pickDisplay(engine.status(), query: displayQuery)
@@ -144,7 +153,8 @@ enum CLI {
                 print("  EDID:  \(edid.manufacturer) \(String(format: "%04X", edid.productCode)), \(edid.bytes.count) bytes\(limit)")
             }
             for mode in report.profile?.modes ?? [] {
-                print("  Added: \(mode)")
+                let preferred = mode == report.profile?.preferredMode ? " (selected after connecting)" : ""
+                print("  Added: \(mode)\(preferred)")
             }
         }
     }

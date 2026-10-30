@@ -3,10 +3,10 @@ import IOKit
 import ModePinCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    /// A display that hasn't taken the override after this many tries in
-    /// `retryWindow` is left alone until it's reconnected or you retry.
+    /// A display that hasn't taken the override after this many tries is left
+    /// alone until it's reconnected, its settings change or you choose
+    /// Re-apply Now, so a refusing display never flickers in a loop.
     private static let maxAttempts = 3
-    private static let retryWindow: TimeInterval = 120
     /// Cheap safety net: reading EDIDs doesn't touch the display.
     private static let pollInterval: TimeInterval = 60
 
@@ -15,7 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingCheck: DispatchWorkItem?
     private var pollTimer: Timer?
     private var notificationPort: IONotificationPortRef?
-    private var attempts: [UUID: [Date]] = [:]
+    private var attempts: [UUID: Int] = [:]
+    /// Profiles whose preferred mode should be selected once the override is
+    /// live, with the number of checks spent waiting for the mode to appear.
+    private var pendingModeSwitch: [UUID: Int] = [:]
+    private static let maxModeSwitchChecks = 10
 
     // MARK: Lifecycle
 
@@ -60,9 +64,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let distributed = DistributedNotificationCenter.default()
         distributed.addObserver(forName: ModePin.profilesChangedNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.engine.store.reload()
-            self?.attempts.removeAll()
-            self?.check(after: 0.2)
+            guard let self else { return }
+            self.engine.store.reload()
+            self.attempts.removeAll()
+            // A settings change (including a new preferred mode) re-selects the preferred mode.
+            for profile in self.engine.store.profiles { self.pendingModeSwitch[profile.id] = 0 }
+            self.check(after: 0.2)
         }
         distributed.addObserver(forName: ModePin.quitNotification, object: nil, queue: .main) { _ in
             NSApp.terminate(nil)
@@ -104,29 +111,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func enforce() {
-        let now = Date()
-        attempts = attempts.mapValues { $0.filter { now.timeIntervalSince($0) < Self.retryWindow } }
-        let exhausted = Set(attempts.filter { $0.value.count >= Self.maxAttempts }.keys)
+        let exhausted = Set(attempts.filter { $0.value >= Self.maxAttempts }.keys)
 
         let reports = engine.enforce(skipping: exhausted)
-        var needsFollowUp = false
+        var followUp: TimeInterval?
         for report in reports {
             guard let id = report.profile?.id else { continue }
             switch (report.state, report.action) {
             case (_, .applied):
-                attempts[id, default: []].append(now)
-                needsFollowUp = true
-            case (.active, _), (.off, _):
+                attempts[id, default: 0] += 1
+                pendingModeSwitch[id] = 0
+                // Confirm the display came back with the new EDID; retry if it didn't.
+                followUp = 6
+            case (.active, _):
                 attempts[id] = nil
-            case (.pending, .none) where exhausted.contains(id):
+                if pendingModeSwitch[id] != nil, !selectPreferredMode(report) {
+                    followUp = min(followUp ?? 2, 2)
+                }
+            case (.off, _):
+                attempts[id] = nil
+                pendingModeSwitch[id] = nil
+            case (.pending, .none) where attempts[id] == Self.maxAttempts:
+                // Counting past the limit makes this log once, not every poll.
+                attempts[id] = Self.maxAttempts + 1
                 Log.error("\(report.name): gave up after \(Self.maxAttempts) attempts; reconnect the display or choose Re-apply Now")
             default:
                 break
             }
         }
         updateIcon(failed: reports.contains { isFailure($0, exhausted: exhausted) })
-        // Confirm the display came back with the new EDID; retry if it didn't.
-        if needsFollowUp { check(after: 6) }
+        if let followUp { check(after: followUp) }
+    }
+
+    /// Selects the profile's preferred mode after an apply. Returns false while
+    /// it should be tried again (the mode isn't listed yet).
+    private func selectPreferredMode(_ report: DisplayReport) -> Bool {
+        guard let profile = report.profile, let edid = report.edid else { return true }
+        guard let mode = profile.preferredMode else {
+            pendingModeSwitch[profile.id] = nil
+            return true
+        }
+        switch ScreenModes.select(mode, on: edid) {
+        case .switched:
+            Log.info("\(report.name): switched to \(mode)")
+        case .alreadyCurrent:
+            break
+        case .notReady:
+            let checks = (pendingModeSwitch[profile.id] ?? 0) + 1
+            guard checks >= Self.maxModeSwitchChecks else {
+                pendingModeSwitch[profile.id] = checks
+                return false
+            }
+            Log.error("\(report.name): \(mode) never showed up in the display's mode list")
+        case .failed(let code):
+            Log.error("\(report.name): switching to \(mode) failed (CGError \(code))")
+        }
+        pendingModeSwitch[profile.id] = nil
+        return true
     }
 
     private func isFailure(_ report: DisplayReport, exhausted: Set<UUID>) -> Bool {
@@ -187,7 +228,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let profile = report.profile {
             for mode in profile.modes {
                 let modeItem = NSMenuItem(title: mode.description, action: nil, keyEquivalent: "")
+                modeItem.state = profile.preferredMode == mode ? .on : .off
                 let modeMenu = NSMenu()
+                let prefer = menuItem("Switch to This After Connecting", #selector(togglePreferredMode(_:)),
+                                      represented: Pick(report: report, mode: mode))
+                prefer.state = profile.preferredMode == mode ? .on : .off
+                modeMenu.addItem(prefer)
+                modeMenu.addItem(.separator())
                 modeMenu.addItem(menuItem("Remove", #selector(removeMode(_:)), represented: Pick(report: report, mode: mode)))
                 modeItem.submenu = modeMenu
                 submenu.addItem(modeItem)
@@ -208,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func summarize(_ report: DisplayReport) -> (String, String, NSColor) {
         let modes = report.profile?.modes.map(\.description).joined(separator: ", ") ?? ""
-        let gaveUp = report.profile.map { (attempts[$0.id]?.count ?? 0) >= Self.maxAttempts } ?? false
+        let gaveUp = report.profile.map { (attempts[$0.id] ?? 0) >= Self.maxAttempts } ?? false
         switch report.state {
         case .active: return ("\(modes) active", "checkmark.circle.fill", .systemGreen)
         case .pending where gaveUp: return ("Display didn't accept \(modes)", "exclamationmark.triangle.fill", .systemOrange)
@@ -284,6 +331,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeMode(_ sender: NSMenuItem) {
         guard let pick = sender.representedObject as? Pick, let mode = pick.mode else { return }
         perform { try engine.removeMode(mode, from: pick.report) }
+    }
+
+    @objc private func togglePreferredMode(_ sender: NSMenuItem) {
+        guard let pick = sender.representedObject as? Pick, let mode = pick.mode, let profile = pick.report.profile else { return }
+        let newValue = profile.preferredMode == mode ? nil : mode
+        perform { try engine.setPreferredMode(newValue, for: pick.report) }
     }
 
     @objc private func toggleEnabled(_ sender: NSMenuItem) {
