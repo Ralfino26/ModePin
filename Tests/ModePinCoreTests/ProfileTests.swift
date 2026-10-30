@@ -30,4 +30,22 @@ final class ProfileTests: XCTestCase {
         try store.remove(profile)
         XCTAssertEqual(ProfileStore(url: url).profiles, [])
     }
+
+    func testPreferredModeDefaultsAndPersistence() throws {
+        let mode = DisplayMode(width: 5120, height: 1440, refresh: 60)
+        var profile = Profile(name: "Odyssey", original: odysseyThroughDock, modes: [mode])
+        XCTAssertEqual(profile.preferredMode, mode)
+
+        // 1.0.0 wrote no preferredMode key: switch to the first added mode.
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(profile)) as! [String: Any]
+        legacy.removeValue(forKey: "preferredMode")
+        let migrated = try JSONDecoder().decode(Profile.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(migrated.preferredMode, mode)
+
+        // An explicit "leave it to macOS" survives a round trip.
+        profile.preferredMode = nil
+        let decoded = try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(profile))
+        XCTAssertNil(decoded.preferredMode)
+        XCTAssertEqual(decoded, profile)
+    }
 }

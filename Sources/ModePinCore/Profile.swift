@@ -12,6 +12,10 @@ public struct Profile: Codable, Identifiable, Equatable, Sendable {
     public var originalEDID: Data
     public var modes: [DisplayMode]
     public var enabled: Bool
+    /// The mode to select after the override is applied, i.e. after the display
+    /// (re)connects. macOS often keeps the resolution it picked from the
+    /// original EDID otherwise. nil leaves the choice to macOS.
+    public var preferredMode: DisplayMode?
 
     public init(name: String, original: EDID, modes: [DisplayMode] = []) {
         id = UUID()
@@ -19,6 +23,33 @@ public struct Profile: Codable, Identifiable, Equatable, Sendable {
         originalEDID = original.data
         self.modes = modes
         enabled = true
+        preferredMode = modes.first
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, originalEDID, modes, enabled, preferredMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        originalEDID = try c.decode(Data.self, forKey: .originalEDID)
+        modes = try c.decode([DisplayMode].self, forKey: .modes)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        // Profiles from 1.0.0 have no key: switch to the first added mode.
+        // An explicit null means "leave it to macOS".
+        preferredMode = c.contains(.preferredMode) ? try c.decodeIfPresent(DisplayMode.self, forKey: .preferredMode) : modes.first
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(originalEDID, forKey: .originalEDID)
+        try c.encode(modes, forKey: .modes)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(preferredMode, forKey: .preferredMode)
     }
 
     public var original: EDID? { EDID(originalEDID) }

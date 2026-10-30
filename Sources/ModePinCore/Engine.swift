@@ -100,6 +100,7 @@ public final class Engine {
         guard !profile.modes.contains(mode) else { throw ModePinError.duplicateMode(mode) }
         guard profile.modes.count < EDIDBuilder.maxModes else { throw ModePinError.tooManyModes(EDIDBuilder.maxModes) }
         profile.modes.append(mode)
+        if profile.modes.count == 1 { profile.preferredMode = mode }
         _ = try profile.customEDID()
         try store.upsert(profile)
         Log.info("\(profile.name): added \(mode)")
@@ -109,8 +110,18 @@ public final class Engine {
         guard var profile = report.profile else { throw ModePinError.notConfigured(report.name) }
         guard profile.modes.contains(mode) else { throw ModePinError.modeNotFound(mode) }
         profile.modes.removeAll { $0 == mode }
+        if profile.preferredMode == mode { profile.preferredMode = profile.modes.first }
         try store.upsert(profile)
         Log.info("\(profile.name): removed \(mode)")
+    }
+
+    /// The mode to select after connecting; nil leaves it to macOS.
+    public func setPreferredMode(_ mode: DisplayMode?, for report: DisplayReport) throws {
+        guard var profile = report.profile else { throw ModePinError.notConfigured(report.name) }
+        if let mode, !profile.modes.contains(mode) { throw ModePinError.modeNotFound(mode) }
+        profile.preferredMode = mode
+        try store.upsert(profile)
+        Log.info("\(profile.name): after connecting, \(mode.map { "switch to \($0)" } ?? "keep macOS's choice")")
     }
 
     public func setEnabled(_ enabled: Bool, for report: DisplayReport) throws {
