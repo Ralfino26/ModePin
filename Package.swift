@@ -4,6 +4,9 @@ import PackageDescription
 let package = Package(
     name: "ModePin",
     platforms: [.macOS(.v13)],
+    products: [
+        .executable(name: "ModePin", targets: ["ModePin"]),
+    ],
     targets: [
         // Declarations for the private IOAVService functions in IOKit.
         .target(
@@ -13,6 +16,10 @@ let package = Package(
         .target(
             name: "ModePinCore",
             dependencies: ["CIOAVService"]
+        ),
+        .executableTarget(
+            name: "ModePin",
+            dependencies: ["ModePinCore"]
         ),
         .testTarget(
             name: "ModePinCoreTests",
