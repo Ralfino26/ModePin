@@ -15,11 +15,11 @@ A display tells the Mac what it supports through its **EDID**. Through some dock
 The override lasts until the display disconnects, so ModePin re-applies it whenever needed:
 
 - **Display connected or reconnected** (IOKit notification, plus macOS screen changes)
-- **Wake from sleep**, screen wake and fast user switching
+- **Wake from sleep**, screen wake and fast user switching. Many monitors drop the override when they go to standby, so this is the common case. ModePin waits until the screens are really on: an override applied while the screen is off, or while the Mac is in dark wake, can stick without macOS ever offering its modes.
 - **Login**, through a LaunchAgent that also restarts ModePin if it crashes
 - **Every 60 seconds** as a safety net. This only reads the EDID, so a display that is already correct never flickers.
 
-After each apply it checks again after 6 seconds. A display that refuses the override three times is left alone, and the menu bar icon shows a warning, until you reconnect it, change its settings or choose **Re-apply Now**. A refusing display never flickers in a loop.
+After each apply it checks again after 6 seconds. If the override is in place but macOS still doesn't offer its modes a few seconds later, ModePin removes it and applies it again from scratch, which renegotiates the link like a replug does. A display that refuses three times is left alone, and the menu bar icon shows a warning, until you reconnect it, wake the Mac, change its settings or choose **Re-apply Now**. A refusing display never flickers in a loop.
 
 Adding a mode isn't always enough: after a reconnect, macOS often keeps the resolution it picked from the display's own EDID. So after applying the override, ModePin also **switches to the display's preferred mode**, which is the first mode you added unless you choose another one. It only does this right after applying. If you pick another resolution yourself, ModePin leaves it alone until the next reconnect.
 

@@ -20,6 +20,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// live, with the number of checks spent waiting for the mode to appear.
     private var pendingModeSwitch: [UUID: Int] = [:]
     private static let maxModeSwitchChecks = 10
+    /// Checks in a row that found the override in place but none of its modes
+    /// offered by macOS. That happens when the display renegotiates while it's
+    /// waking up; only a fresh apply fixes it.
+    private var missingModeChecks: [UUID: Int] = [:]
+    private static let maxMissingModeChecks = 3
+    /// Set between the screens going to sleep and waking. ModePin never touches
+    /// a display then: an override applied to a sleeping or half-awake display
+    /// can stick without macOS ever offering its modes.
+    private var screensAsleep = false
 
     // MARK: Lifecycle
 
@@ -56,9 +65,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let workspace = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.willSleepNotification] {
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.check(after: 2)
+                guard let self else { return }
+                self.screensAsleep = true
+                self.pendingCheck?.cancel()
+            }
+        }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                guard let self else { return }
+                if notification.name != NSWorkspace.sessionDidBecomeActiveNotification {
+                    self.screensAsleep = false
+                }
+                // Waking drops the override like a reconnect does, so each wake gets fresh attempts.
+                self.attempts.removeAll()
+                self.missingModeChecks.removeAll()
+                self.check(after: 2)
             }
         }
 
@@ -99,7 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func displayServicesChanged() {
         attempts.removeAll()
+        missingModeChecks.removeAll()
         check(after: 1.5)
+    }
+
+    /// The screens are on and the Mac is fully awake (not in dark wake).
+    private var displaysAwake: Bool {
+        !screensAsleep && CGDisplayIsAsleep(CGMainDisplayID()) == 0
     }
 
     /// Coalesces bursts of events (a replug fires several) into one check.
@@ -111,36 +140,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func enforce() {
+        // Waking up comes back here through screensDidWake.
+        guard displaysAwake else { return }
+
         let exhausted = Set(attempts.filter { $0.value >= Self.maxAttempts }.keys)
 
         let reports = engine.enforce(skipping: exhausted)
         var followUp: TimeInterval?
+        func checkAgain(after delay: TimeInterval) { followUp = min(followUp ?? delay, delay) }
+
         for report in reports {
-            guard let id = report.profile?.id else { continue }
+            guard let profile = report.profile, let edid = report.edid else { continue }
+            let id = profile.id
             switch (report.state, report.action) {
             case (_, .applied):
                 attempts[id, default: 0] += 1
+                missingModeChecks[id] = nil
                 pendingModeSwitch[id] = 0
                 // Confirm the display came back with the new EDID; retry if it didn't.
-                followUp = 6
+                checkAgain(after: 6)
             case (.active, _):
-                attempts[id] = nil
-                if pendingModeSwitch[id] != nil, !selectPreferredMode(report) {
-                    followUp = min(followUp ?? 2, 2)
+                if pendingModeSwitch[id] != nil {
+                    if !selectPreferredMode(report) { checkAgain(after: 2) }
+                    continue
+                }
+                switch ScreenModes.offersAny(of: profile.modes, on: edid) {
+                case true?:
+                    attempts[id] = nil
+                    missingModeChecks[id] = nil
+                case false?:
+                    let checks = missingModeChecks[id, default: 0] + 1
+                    missingModeChecks[id] = checks
+                    if checks >= Self.maxMissingModeChecks {
+                        if reapplyFromScratch(report) { checkAgain(after: 3) }
+                    } else {
+                        checkAgain(after: 2)
+                    }
+                case nil:
+                    // Offline or asleep: the wake notifications and the poll come back to it.
+                    break
                 }
             case (.off, _):
                 attempts[id] = nil
+                missingModeChecks[id] = nil
                 pendingModeSwitch[id] = nil
             case (.pending, .none) where attempts[id] == Self.maxAttempts:
-                // Counting past the limit makes this log once, not every poll.
-                attempts[id] = Self.maxAttempts + 1
-                Log.error("\(report.name): gave up after \(Self.maxAttempts) attempts; reconnect the display or choose Re-apply Now")
+                logGiveUp(report)
             default:
                 break
             }
         }
-        updateIcon(failed: reports.contains { isFailure($0, exhausted: exhausted) })
+        updateIcon(failed: reports.contains(where: isFailure))
         if let followUp { check(after: followUp) }
+    }
+
+    /// The override is in place but macOS never offered its modes. Removing it
+    /// makes the next check apply it again, which renegotiates the link like a
+    /// replug. Returns false once the attempts for this connection are used up.
+    private func reapplyFromScratch(_ report: DisplayReport) -> Bool {
+        guard let id = report.profile?.id else { return false }
+        missingModeChecks[id] = nil
+        guard attempts[id, default: 0] < Self.maxAttempts else {
+            if attempts[id] == Self.maxAttempts { logGiveUp(report) }
+            return false
+        }
+        Log.info("\(report.name): macOS isn't offering the added modes; re-applying from scratch")
+        do {
+            try report.display.clearVirtualEDID()
+            return true
+        } catch {
+            Log.error("\(report.name): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func logGiveUp(_ report: DisplayReport) {
+        guard let id = report.profile?.id else { return }
+        // Counting past the limit makes this log once, not every poll.
+        attempts[id] = Self.maxAttempts + 1
+        Log.error("\(report.name): gave up after \(Self.maxAttempts) attempts; reconnect the display or choose Re-apply Now")
     }
 
     /// Selects the profile's preferred mode after an apply. Returns false while
@@ -154,15 +232,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch ScreenModes.select(mode, on: edid) {
         case .switched:
             Log.info("\(report.name): switched to \(mode)")
+            attempts[profile.id] = nil
         case .alreadyCurrent:
-            break
+            attempts[profile.id] = nil
         case .notReady:
             let checks = (pendingModeSwitch[profile.id] ?? 0) + 1
             guard checks >= Self.maxModeSwitchChecks else {
                 pendingModeSwitch[profile.id] = checks
                 return false
             }
-            Log.error("\(report.name): \(mode) never showed up in the display's mode list")
+            // The next checks notice the missing mode and re-apply from scratch.
+            Log.error("\(report.name): \(mode) didn't show up in the display's mode list")
+            pendingModeSwitch[profile.id] = nil
+            return false
         case .failed(let code):
             Log.error("\(report.name): switching to \(mode) failed (CGError \(code))")
         }
@@ -170,10 +252,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    private func isFailure(_ report: DisplayReport, exhausted: Set<UUID>) -> Bool {
+    private func gaveUp(_ report: DisplayReport) -> Bool {
+        report.profile.map { (attempts[$0.id] ?? 0) >= Self.maxAttempts } ?? false
+    }
+
+    private func isFailure(_ report: DisplayReport) -> Bool {
         if case .failed = report.state { return true }
-        if report.state == .pending, let id = report.profile?.id, exhausted.contains(id) { return true }
-        return false
+        return (report.state == .pending || report.state == .active) && gaveUp(report)
     }
 
     // MARK: Menu
@@ -255,8 +340,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func summarize(_ report: DisplayReport) -> (String, String, NSColor) {
         let modes = report.profile?.modes.map(\.description).joined(separator: ", ") ?? ""
-        let gaveUp = report.profile.map { (attempts[$0.id] ?? 0) >= Self.maxAttempts } ?? false
+        let gaveUp = gaveUp(report)
         switch report.state {
+        case .active where gaveUp: return ("macOS isn't offering \(modes)", "exclamationmark.triangle.fill", .systemOrange)
         case .active: return ("\(modes) active", "checkmark.circle.fill", .systemGreen)
         case .pending where gaveUp: return ("Display didn't accept \(modes)", "exclamationmark.triangle.fill", .systemOrange)
         case .pending: return ("Applying \(modes)…", "arrow.triangle.2.circlepath", .systemBlue)
@@ -294,6 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func reapply() {
         attempts.removeAll()
+        missingModeChecks.removeAll()
         check(after: 0)
     }
 

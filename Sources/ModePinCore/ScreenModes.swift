@@ -13,15 +13,9 @@ public enum ScreenModes {
     }
 
     public static func select(_ mode: DisplayMode, on edid: EDID) -> Result {
-        guard let display = onlineDisplay(for: edid) else { return .notReady }
+        guard let display = onlineDisplay(for: edid), CGDisplayIsAsleep(display) == 0 else { return .notReady }
 
-        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
-        let all = CGDisplayCopyAllDisplayModes(display, options) as? [CGDisplayMode] ?? []
-        // The 1× (non-HiDPI) mode with this size and refresh rate.
-        let candidates = all.filter {
-            $0.pixelWidth == mode.width && $0.pixelHeight == mode.height && $0.width == mode.width
-                && Int($0.refreshRate.rounded()) == mode.refresh && $0.isUsableForDesktopGUI()
-        }
+        let candidates = matchingModes(mode, on: display)
         guard let target = candidates.first else { return .notReady }
 
         if let current = CGDisplayCopyDisplayMode(display), candidates.contains(where: { $0.ioDisplayModeID == current.ioDisplayModeID }) {
@@ -37,6 +31,23 @@ public enum ScreenModes {
         }
         let completed = CGCompleteDisplayConfiguration(config, .permanently)
         return completed == .success ? .switched : .failed(completed.rawValue)
+    }
+
+    /// Whether macOS offers any of `modes` on the display that `edid` belongs
+    /// to. nil when that can't be told yet: the display is offline or asleep.
+    public static func offersAny(of modes: [DisplayMode], on edid: EDID) -> Bool? {
+        guard let display = onlineDisplay(for: edid), CGDisplayIsAsleep(display) == 0 else { return nil }
+        return modes.contains { !matchingModes($0, on: display).isEmpty }
+    }
+
+    /// The 1× (non-HiDPI) modes with this size and refresh rate.
+    private static func matchingModes(_ mode: DisplayMode, on display: CGDirectDisplayID) -> [CGDisplayMode] {
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        let all = CGDisplayCopyAllDisplayModes(display, options) as? [CGDisplayMode] ?? []
+        return all.filter {
+            $0.pixelWidth == mode.width && $0.pixelHeight == mode.height && $0.width == mode.width
+                && Int($0.refreshRate.rounded()) == mode.refresh && $0.isUsableForDesktopGUI()
+        }
     }
 
     /// Matches on vendor, model and serial, which macOS takes from the EDID.
